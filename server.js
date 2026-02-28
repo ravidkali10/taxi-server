@@ -1,65 +1,106 @@
 const express = require('express');
-const cors = require('cors');
-const bodyParser = require('body-parser');
 const mongoose = require('mongoose');
-
+const fetch = require('node-fetch');
 const app = express();
-const port = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json());
 
-// MongoDB bağlantısı - BURAYA SƏNİN REAL ATLAS CONNECTION STRING-İNİ QOY
-mongoose.connect('mongodb+srv://kalikali:Pasword@taxibet.lzyqrgu.mongodb.net/taxidb?retryWrites=true&w=majority')
-  .then(() => console.log('MongoDB bağlıdır'))
-  .catch(err => console.log('MongoDB xətası:', err));
+// MongoDB bağlantısı (Render-da environment variable-dan MongoDB URL al)
+mongoose.connect(process.env.MONGODB_URI || 'mongodb+srv://user:pass@cluster.mongodb.net/carbet?retryWrites=true&w=majority', {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+}).then(() => console.log('MongoDB bağlıdır'))
+  .catch(err => console.log('MongoDB xətası: ' + err));
 
-// User modeli (balans saxlamaq üçün)
-const userSchema = new mongoose.Schema({
-  userId: String,          // istifadəçi ID (məsələn telefon nömrəsi və ya email)
-  balance: { type: Number, default: 0 }
-});
-const User = mongoose.model('User', userSchema);
-
-// Root route (brauzerdə linkə girəndə nə göstərsin)
-app.get('/', (req, res) => {
-  res.send('Taxi Server işləyir! API endpoint-ləri: /balance/:userId və /add-balance');
+const UserSchema = new mongoose.Schema({
+  userId: String,
+  balance: { type: Number, default: 0 },
+  email: String
 });
 
-// İstifadəçinin balansını əldə et
-app.get('/balance/:userId', async (req, res) => {
-  try {
-    const user = await User.findOne({ userId: req.params.userId });
-    res.json({ balance: user ? user.balance : 0 });
-  } catch (err) {
-    res.status(500).json({ error: 'Xəta baş verdi' });
-  }
-});
+const User = mongoose.model('User', UserSchema);
 
-// Balans artır (ödəniş təsdiqlənəndə bu endpoint çağrılacaq)
+// Balans artırma endpoint-i
 app.post('/add-balance', async (req, res) => {
-  try {
-    const { userId, amount } = req.body;
-    if (!userId || !amount) {
-      return res.status(400).json({ error: 'userId və amount lazımdır' });
-    }
+  const { userId, amount } = req.body;
 
+  if (!userId || !amount || amount < 10) {
+    return res.status(400).json({ error: 'Yanlış məlumat' });
+  }
+
+  try {
     let user = await User.findOne({ userId });
     if (!user) {
-      user = new User({ userId, balance: 0 });
+      user = new User({ userId, email: req.body.email || 'guest', balance: 0 });
     }
 
-    user.balance += parseFloat(amount);
+    user.balance += amount;
     await user.save();
 
     res.json({ success: true, newBalance: user.balance });
   } catch (err) {
-    res.status(500).json({ error: 'Balans artırma xətası' });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Serveri işə sal
-app.listen(port, () => {
-  console.log(`Server http://localhost:${port} üzərində işləyir`);
+// NowPayments invoice yaratma endpoint-i
+app.post('/create-nowpayments-invoice', async (req, res) => {
+  const { amount, userId } = req.body;
+
+  if (!amount || amount < 10) {
+    return res.status(400).json({ error: 'Minimum 10 AZN' });
+  }
+
+  try {
+    const response = await fetch('https://api.nowpayments.io/v1/invoice', {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.NOWPAYMENTS_API_KEY,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        price_amount: amount,
+        price_currency: 'AZN',
+        pay_currency: 'usd', // kart üçün USD, kripto üçün 'usdttrc20' dəyişə bilərsən
+        order_id: userId || 'guest_' + Date.now(),
+        order_description: 'Balans artırma - ' + amount + ' AZN'
+      })
+    });
+
+    const data = await response.json();
+    if (data.invoice_url) {
+      res.json({ invoice_url: data.invoice_url });
+    } else {
+      res.status(400).json({ error: data.message || 'Invoice yaradılmadı' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// IPN (ödəniş təsdiq endpoint-i) - NowPayments-dan gələn callback
+app.post('/nowpayments-ipn', async (req, res) => {
+  const { payment_status, price_amount, order_id } = req.body;
+
+  if (payment_status === 'finished') {
+    const amount = parseFloat(price_amount);
+    const userId = order_id.split('_')[0];
+
+    try {
+      let user = await User.findOne({ userId });
+      if (user) {
+        user.balance += amount;
+        await user.save();
+        console.log(`Balans artıldı: ${userId} + ${amount} AZN`);
+      }
+    } catch (err) {
+      console.log('IPN xətası: ' + err.message);
+    }
+  }
+
+  res.sendStatus(200);
+});
+
+app.listen(process.env.PORT || 3000, () => {
+  console.log('Server işləyir');
 });
